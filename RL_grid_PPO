@@ -1,0 +1,119 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+
+# 环境参数
+n_states = 5
+ACTIONS = ["left", "right"]
+goal_state = 4
+gamma = 0.9
+episodes = 200
+ppo_epochs = 5       # 每个采样批次 PPO 更新次数
+clip_eps = 0.2       # PPO clip 范围
+
+# 环境函数
+def take_action(state, action):
+    if action == "right":
+        next_state = min(state + 1, n_states - 1)
+    elif action == "left":
+        next_state = max(state - 1, 0)
+    else:
+        raise ValueError("未知动作标签")
+    reward = 1 if next_state == goal_state else 0
+    return next_state, reward
+
+# 策略网络
+class PolicyNet(nn.Module):
+    def __init__(self, n_states, n_actions):
+        super().__init__()
+        self.fc = nn.Linear(n_states, 16)
+        self.out = nn.Linear(16, n_actions)
+
+    def forward(self, x):
+        x = torch.relu(self.fc(x))
+        return torch.softmax(self.out(x), dim=-1)
+
+# 状态编码
+def one_hot_state(state):
+    return torch.eye(n_states)[state].unsqueeze(0)  # shape (1, n_states)
+
+# 初始化
+policy_net = PolicyNet(n_states, len(ACTIONS))
+optimizer = optim.Adam(policy_net.parameters(), lr=0.01)
+
+print("开始训练 PPO...")
+
+for ep in range(episodes):
+    # -------- 采样一条完整轨迹 --------
+    states = []
+    actions = []
+    rewards = []
+    old_log_probs = []
+
+    state = 0
+    while state != goal_state:
+        probs = policy_net(one_hot_state(state))
+        dist = torch.distributions.Categorical(probs)
+        action_idx = dist.sample().item()
+        action = ACTIONS[action_idx]
+
+        states.append(state)
+        actions.append(action_idx)
+        old_log_probs.append(dist.log_prob(torch.tensor(action_idx)).detach())
+
+        next_state, reward = take_action(state, action)
+        rewards.append(reward)
+
+        state = next_state
+
+    # -------- 计算回报（return）和优势 --------
+    returns = []
+    G = 0
+    for r in reversed(rewards):
+        G = r + gamma * G
+        returns.insert(0, G)
+    returns = torch.tensor(returns, dtype=torch.float32)
+    # 标准化
+    if len(returns) > 1:
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+    advantages = returns.clone()  # 这里直接用 returns 近似 Advantage
+
+    # -------- PPO多次更新 --------
+    states_tensor = torch.cat([one_hot_state(s) for s in states], dim=0)
+    actions_tensor = torch.tensor(actions)
+    old_log_probs_tensor = torch.stack(old_log_probs)
+
+    for _ in range(ppo_epochs):
+        # 重新计算当前策略的 log 概率
+        probs = policy_net(states_tensor)
+        dist = torch.distributions.Categorical(probs)
+        new_log_probs = dist.log_prob(actions_tensor)
+
+        # 计算 ratio
+        ratio = torch.exp(new_log_probs - old_log_probs_tensor)
+
+        # 计算两个目标版本
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
+
+        # PPO 损失：取两个版本的最小值
+        loss = -torch.min(surr1, surr2).mean()
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+# -------- 检查策略输出 --------
+for s in range(n_states):
+    probs = policy_net(one_hot_state(s)).detach().numpy()[0]
+    print(f"State {s}: " + ", ".join(f"{a}={p:.2f}" for a, p in zip(ACTIONS, probs)))
+
+"""
+开始训练 PPO...
+State 0: left=0.41, right=0.59
+State 1: left=0.29, right=0.71
+State 2: left=0.00, right=1.00
+State 3: left=0.00, right=1.00
+State 4: left=0.12, right=0.88
+"""
